@@ -2,6 +2,7 @@ package de.danoeh.antennapod.fragment;
 
 
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
@@ -23,29 +24,39 @@ import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+
+import androidx.appcompat.widget.Toolbar;
 import com.google.android.material.chip.Chip;
+import com.google.android.material.snackbar.Snackbar;
+import com.leinardi.android.speeddial.SpeedDialView;
 
 import de.danoeh.antennapod.R;
 import de.danoeh.antennapod.activity.MainActivity;
 import de.danoeh.antennapod.activity.OnlineFeedViewActivity;
 import de.danoeh.antennapod.adapter.EpisodeItemListAdapter;
 import de.danoeh.antennapod.adapter.HorizontalFeedListAdapter;
+import de.danoeh.antennapod.core.dialog.ConfirmationDialog;
 import de.danoeh.antennapod.core.menuhandler.MenuItemUtils;
+import de.danoeh.antennapod.core.storage.DBReader;
 import de.danoeh.antennapod.event.EpisodeDownloadEvent;
 import de.danoeh.antennapod.event.FeedItemEvent;
 import de.danoeh.antennapod.event.playback.PlaybackPositionEvent;
 import de.danoeh.antennapod.event.PlayerStatusEvent;
 import de.danoeh.antennapod.event.UnreadItemsUpdateEvent;
+import de.danoeh.antennapod.fragment.actions.EpisodeMultiSelectActionHandler;
 import de.danoeh.antennapod.model.feed.Feed;
 import de.danoeh.antennapod.model.feed.FeedItem;
 import de.danoeh.antennapod.core.storage.FeedSearcher;
 import de.danoeh.antennapod.core.util.FeedItemUtil;
 import de.danoeh.antennapod.menuhandler.FeedItemMenuHandler;
+import de.danoeh.antennapod.model.feed.FeedItemFilter;
 import de.danoeh.antennapod.net.discovery.CombinedSearcher;
+import de.danoeh.antennapod.storage.preferences.UserPreferences;
 import de.danoeh.antennapod.view.EmptyViewHandler;
 import de.danoeh.antennapod.view.EpisodeItemListRecyclerView;
 import de.danoeh.antennapod.view.LiftOnScrollListener;
 import de.danoeh.antennapod.view.viewholder.EpisodeItemViewHolder;
+import io.reactivex.Completable;
 import io.reactivex.Observable;
 import io.reactivex.android.schedulers.AndroidSchedulers;
 import io.reactivex.disposables.Disposable;
@@ -63,7 +74,8 @@ import de.danoeh.antennapod.event.FeedListUpdateEvent;
 /**
  * Performs a search operation on all feeds or one specific feed and displays the search result.
  */
-public class SearchFragment extends Fragment {
+public class SearchFragment extends Fragment implements
+        EpisodeItemListAdapter.OnSelectModeListener,  Toolbar.OnMenuItemClickListener {
     private static final String TAG = "SearchFragment";
     private static final String ARG_QUERY = "query";
     private static final String ARG_FEED = "feed";
@@ -81,6 +93,13 @@ public class SearchFragment extends Fragment {
     private SearchView searchView;
     private Handler automaticSearchDebouncer;
     private long lastQueryChange = 0;
+
+    MaterialToolbar toolbar;
+
+    SpeedDialView speedDialView;
+
+    protected static final int EPISODES_PER_PAGE = 150;
+    protected int page = 1;
 
     /**
      * Create a new SearchFragment that searches all feeds.
@@ -135,6 +154,14 @@ public class SearchFragment extends Fragment {
         setupToolbar(layout.findViewById(R.id.toolbar));
         progressBar = layout.findViewById(R.id.progressBar);
 
+        toolbar = layout.findViewById(R.id.toolbar);
+        toolbar.setOnMenuItemClickListener(this);
+        toolbar.setOnLongClickListener(v -> {
+            recyclerView.scrollToPosition(5);
+            recyclerView.post(() -> recyclerView.smoothScrollToPosition(0));
+            return false;
+        });
+
         recyclerView = layout.findViewById(R.id.recyclerView);
         recyclerView.setRecycledViewPool(((MainActivity) getActivity()).getRecycledViewPool());
         registerForContextMenu(recyclerView);
@@ -142,9 +169,13 @@ public class SearchFragment extends Fragment {
             @Override
             public void onCreateContextMenu(ContextMenu menu, View v, ContextMenu.ContextMenuInfo menuInfo) {
                 super.onCreateContextMenu(menu, v, menuInfo);
+                if (!inActionMode()) {
+                    menu.findItem(R.id.multi_select).setVisible(true);
+                }
                 MenuItemUtils.setOnClickListeners(menu, SearchFragment.this::onContextItemSelected);
             }
         };
+        adapter.setOnSelectModeListener(this);
         recyclerView.setAdapter(adapter);
         recyclerView.addOnScrollListener(new LiftOnScrollListener(layout.findViewById(R.id.appbar)));
 
@@ -180,7 +211,7 @@ public class SearchFragment extends Fragment {
             search();
         }
         searchView.setOnQueryTextFocusChangeListener((view, hasFocus) -> {
-            if (hasFocus) {
+            if (hasFocus  && !speedDialView.isOpen()) {
                 showInputMethod(view.findFocus());
             }
         });
@@ -195,7 +226,74 @@ public class SearchFragment extends Fragment {
                 }
             }
         });
+
+        speedDialView = layout.findViewById(R.id.fabSD);
+        speedDialView.setOverlayLayout(layout.findViewById(R.id.fabSDOverlay));
+        speedDialView.inflate(R.menu.episodes_apply_action_speeddial);
+
+        speedDialView.setOnChangeListener(new SpeedDialView.OnChangeListener() {
+            @Override
+            public boolean onMainActionSelected() {
+                return false;
+            }
+
+            @Override
+            public void onToggleChanged(boolean open) {
+                searchView.clearFocus();
+                if (open && adapter.getSelectedCount() == 0) {
+                    ((MainActivity) getActivity()).showSnackbarAbovePlayer(R.string.no_items_selected,
+                            Snackbar.LENGTH_SHORT);
+                    speedDialView.close();
+                }
+            }
+        });
+        speedDialView.setOnActionSelectedListener(actionItem -> {
+            int confirmationString = 0;
+            if (adapter.getSelectedItems().size() >= 25 || adapter.shouldSelectLazyLoadedItems()) {
+                // Should ask for confirmation
+                if (actionItem.getId() == R.id.mark_read_batch) {
+                    confirmationString = R.string.multi_select_mark_played_confirmation;
+                } else if (actionItem.getId() == R.id.mark_unread_batch) {
+                    confirmationString = R.string.multi_select_mark_unplayed_confirmation;
+                }
+            }
+            if (confirmationString == 0) {
+                performMultiSelectAction(actionItem.getId());
+            } else {
+                new ConfirmationDialog(getActivity(), R.string.multi_select, confirmationString) {
+                    @Override
+                    public void onConfirmButtonPressed(DialogInterface dialog) {
+                        performMultiSelectAction(actionItem.getId());
+                    }
+                }.createNewDialog().show();
+            }
+            return true;
+        });
+
+
         return layout;
+    }
+
+    private void performMultiSelectAction(int actionItemId) {
+        EpisodeMultiSelectActionHandler handler =
+                new EpisodeMultiSelectActionHandler(((MainActivity) getActivity()), actionItemId);
+        Completable.fromAction(
+                        () -> {
+                            handler.handleAction(adapter.getSelectedItems());
+                            if (adapter.shouldSelectLazyLoadedItems()) {
+                                int applyPage = page + 1;
+                                List<FeedItem> nextPage;
+                                do {
+                                    nextPage = loadMoreData(applyPage);
+                                    handler.handleAction(nextPage);
+                                    applyPage++;
+                                } while (nextPage.size() == EPISODES_PER_PAGE);
+                            }
+                        })
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(() -> adapter.endSelectMode(),
+                        error -> Log.e(TAG, Log.getStackTraceString(error)));
     }
 
     @Override
@@ -252,18 +350,21 @@ public class SearchFragment extends Fragment {
         });
     }
 
-    @Override
+
     public boolean onContextItemSelected(@NonNull MenuItem item) {
+        Log.d(TAG, "onContextItemSelected() called with: " + "item = [" + item + "]");
         Feed selectedFeedItem  = adapterFeeds.getLongPressedItem();
         if (selectedFeedItem != null
                 && FeedMenuHandler.onMenuItemClicked(this, item.getItemId(), selectedFeedItem, () -> { })) {
             return true;
-        }
-        FeedItem selectedItem = adapter.getLongPressedItem();
-        if (selectedItem != null && FeedItemMenuHandler.onMenuItemClicked(this, item.getItemId(), selectedItem)) {
+        } else if (adapter.getLongPressedItem() == null) {
+            Log.i(TAG, "Selected item or listAdapter was null, ignoring selection");
+            return super.onContextItemSelected(item);
+        } else if (adapter.onContextItemSelected(item)) {
             return true;
         }
-        return super.onContextItemSelected(item);
+        FeedItem selectedItem = adapter.getLongPressedItem();
+        return FeedItemMenuHandler.onMenuItemClicked(this, item.getItemId(), selectedItem);
     }
 
     @Subscribe(threadMode = ThreadMode.MAIN)
@@ -371,7 +472,7 @@ public class SearchFragment extends Fragment {
         List<Feed> feeds = FeedSearcher.searchFeeds(query);
         return new Pair<>(items, feeds);
     }
-    
+
     private void showInputMethod(View view) {
         InputMethodManager imm = (InputMethodManager) getActivity().getSystemService(Context.INPUT_METHOD_SERVICE);
         if (imm != null) {
@@ -392,5 +493,32 @@ public class SearchFragment extends Fragment {
         }
         ((MainActivity) getActivity()).loadChildFragment(
                 OnlineSearchFragment.newInstance(CombinedSearcher.class, query));
+    }
+
+    @Override
+    public boolean onMenuItemClick(MenuItem item) {
+        if (super.onOptionsItemSelected(item)) {
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void onStartSelectMode() {
+        speedDialView.setVisibility(View.VISIBLE);
+
+    }
+
+    @Override
+    public void onEndSelectMode() {
+        speedDialView.close();
+        speedDialView.setVisibility(View.GONE);
+
+    }
+
+    @NonNull
+    protected List<FeedItem> loadMoreData(int page) {
+        return DBReader.getEpisodes((page - 1) * EPISODES_PER_PAGE, EPISODES_PER_PAGE,
+                new FeedItemFilter(FeedItemFilter.NEW), UserPreferences.getInboxSortedOrder());
     }
 }
